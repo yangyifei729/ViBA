@@ -1,0 +1,689 @@
+from __future__ import absolute_import, division, print_function
+import argparse
+import logging
+import os
+import random
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+import sklearn.metrics as mtc
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from transformers import AdamW, SchedulerType, get_scheduler
+from trainer import Trainer, FreeLBTrainer
+from transformers import BertPreTrainedModel, BertModel
+from transformers.modeling_outputs import TokenClassifierOutput
+
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+                    datefmt="%m/%d/%Y %H:%M:%S",
+                    level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def mask_boundary(hidden_states, input_ids, label_ids, noise_probability=0.3):
+    input_ids, label_ids = input_ids.detach().cpu().clone().numpy(), label_ids.detach().cpu().clone().numpy()
+    probability_matrix = []
+    for tokens, predictions in zip(input_ids, label_ids):
+        probability_matrix += [[]]
+        is_ent = False
+        for i, (t, p) in enumerate(zip(tokens, predictions)):
+            if not is_ent and p in {0, -100}:
+                probability_matrix[-1] += [0]
+                continue
+            if not is_ent and p not in {0, -100}:
+                is_ent = True
+                probability_matrix[-1] += [noise_probability]
+            elif is_ent and p not in {0, -100}:
+                probability_matrix[-1] += [0]
+            else:
+                is_ent = False
+                probability_matrix[-1][-1] = noise_probability
+                probability_matrix[-1] += [0]
+        if is_ent:
+            probability_matrix[-1][-1] = noise_probability
+
+    masked_indices = torch.bernoulli(torch.tensor(probability_matrix)).bool()
+    hidden_states[masked_indices] = 0
+
+    return hidden_states
+
+
+class BertForTokenClassification(BertPreTrainedModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.bert = BertModel(config, add_pooling_layer=False)
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+        if self.training:
+            sequence_output = mask_boundary(sequence_output, input_ids, labels)
+
+        sequence_output = self.dropout(sequence_output)
+        logits = self.classifier(sequence_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TokenClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class InputExample(object):
+    def __init__(self, guid, text_a, text_b=None, labels=None):
+        self.guid = guid
+        self.text_a = text_a
+        self.text_b = text_b
+        self.labels = labels
+
+
+class InputFeatures(object):
+    def __init__(self, input_ids, input_mask, segment_ids, label_ids):
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+        self.label_ids = label_ids
+
+
+class ConllProcessor:
+    """Processor for the CoNLL-2003 data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.txt")), "train")
+
+    def get_dev_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "valid.txt")), "dev")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.txt")), "test")
+
+    def get_labels(self):
+        return ["O", "B-MISC", "I-MISC",  "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
+
+    @staticmethod
+    def _read_csv(input_file):
+        with open(input_file, "r", encoding="utf-8") as f:
+            lines = []
+            sentence = []
+            labels = []
+            for line in f:
+                if len(line) == 0 or line.startswith("-DOCSTART") or line[0] == "\n":
+                    if len(sentence) > 0:
+                        lines.append((sentence, labels))
+                        sentence = []
+                        labels = []
+                    continue
+                splits = line.split()
+                sentence.append(splits[0])
+                labels.append(splits[-1])
+            if len(sentence) > 0:
+                lines.append((sentence, labels))
+            return lines
+
+    @staticmethod
+    def _create_examples(lines, set_type):
+        examples = []
+        for i, (sentence, labels) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = sentence
+            text_b = None
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, labels=labels))
+        return examples
+
+
+class WnutProcessor:
+    """Processor for the WNUT-2017 data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.txt")), "train")
+
+    def get_dev_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "dev.txt")), "dev")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.txt")), "test")
+
+    def get_labels(self):
+        return ["O", "B-corporation", "B-creative-work", "B-group", "B-location", "B-person", "B-product",
+                "I-corporation", "I-creative-work", "I-group", "I-location", "I-person", "I-product"]
+
+    @staticmethod
+    def _read_csv(input_file):
+        with open(input_file, "r", encoding="utf-8") as f:
+            lines = []
+            sentence = []
+            labels = []
+            for line in f:
+                if len(line) == 0 or line[0] == "\n":
+                    if len(sentence) > 0:
+                        lines.append((sentence, labels))
+                        sentence = []
+                        labels = []
+                    continue
+                splits = line.split()
+                sentence.append(splits[0])
+                labels.append(splits[-1])
+            if len(sentence) > 0:
+                lines.append((sentence, labels))
+            return lines
+
+    @staticmethod
+    def _create_examples(lines, set_type):
+        examples = []
+        for i, (sentence, labels) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = sentence
+            text_b = None
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, labels=labels))
+        return examples
+
+
+class MsraProcessor:
+    """Processor for the MSRA data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.char.bmes")), "train")
+
+    def get_dev_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "dev.char.bmes")), "dev")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.char.bmes")), "test")
+
+    def get_labels(self):
+        return ["O", "B-NR", "B-NS", "B-NT", "E-NR", "E-NS", "E-NT", "M-NR", "M-NS", "M-NT", "S-NR", "S-NS", "S-NT"]
+
+    @staticmethod
+    def _read_csv(input_file):
+        with open(input_file, "r", encoding="utf-8") as f:
+            lines = []
+            sentence = []
+            labels = []
+            for line in f:
+                if len(line) == 0 or line[0] == "\n":
+                    if len(sentence) > 0:
+                        lines.append((sentence, labels))
+                        sentence = []
+                        labels = []
+                    continue
+                splits = line.split()
+                sentence.append(splits[0])
+                labels.append(splits[-1])
+            if len(sentence) > 0:
+                lines.append((sentence, labels))
+            return lines
+
+    @staticmethod
+    def _create_examples(lines, set_type):
+        examples = []
+        for i, (sentence, labels) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = sentence
+            text_b = None
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, labels=labels))
+        return examples
+
+
+class OntonotesProcessor:
+    """Processor for the OntoNotes-5.0 data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.char.bmes")), "train")
+
+    def get_dev_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "dev.char.bmes")), "dev")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.char.bmes")), "test")
+
+    def get_labels(self):
+        return  ["O", "B-PERSON", "I-PERSON", "B-NORP", "I-NORP", "B-FAC", "I-FAC", "B-ORG", "I-ORG",
+                 "B-GPE", "I-GPE", "B-LOC", "I-LOC", "B-PRODUCT", "I-PRODUCT", "B-DATE", "I-DATE",
+                 "B-TIME", "I-TIME", "B-PERCENT", "I-PERCENT", "B-MONEY", "I-MONEY", "B-QUANTITY", "I-QUANTITY",
+                 "B-ORDINAL", "I-ORDINAL", "B-CARDINAL", "I-CARDINAL", "B-EVENT", "I-EVENT",
+                 "B-WORK_OF_ART", "I-WORK_OF_ART", "B-LAW", "I-LAW", "B-LANGUAGE", "I-LANGUAGE"]
+
+    @staticmethod
+    def _read_csv(input_file):
+        with open(input_file, "r", encoding="utf-8") as f:
+            lines = []
+            sentence = []
+            labels = []
+            for line in f:
+                if len(line) == 0 or line[0] == "\n":
+                    if len(sentence) > 0:
+                        lines.append((sentence, labels))
+                        sentence = []
+                        labels = []
+                    continue
+                splits = line.split()
+                sentence.append(splits[0])
+                labels.append(splits[-1])
+            if len(sentence) > 0:
+                lines.append((sentence, labels))
+            return lines
+
+    @staticmethod
+    def _create_examples(lines, set_type):
+        examples = []
+        for i, (sentence, labels) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text_a = sentence
+            text_b = None
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, labels=labels))
+        return examples
+
+
+def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer):
+    label_map = {label: i for i, label in enumerate(label_list)}
+    features = []
+    for i, example in enumerate(examples):
+        encoded_inputs = tokenizer(example.text_a,
+                                   max_length=max_seq_length,
+                                   padding="max_length",
+                                   truncation=True,
+                                   return_token_type_ids=True,
+                                   is_split_into_words=True)
+
+        labels = example.labels
+        word_ids = encoded_inputs.word_ids()
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:
+            # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+            # ignored in the loss function.
+            if word_idx is None:
+                label_ids.append(-100)
+            # We set the label for the first token of each word.
+            elif word_idx != previous_word_idx:
+                label_ids.append(label_map[labels[word_idx]])
+            else:
+                label_ids.append(-100)
+            previous_word_idx = word_idx
+
+        input_ids = encoded_inputs["input_ids"]
+        input_mask = encoded_inputs["attention_mask"]
+        segment_ids = encoded_inputs["token_type_ids"]
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+        assert len(label_ids) == max_seq_length
+
+        if i < 5:
+            logger.info("*** Example ***")
+            logger.info("guid: %s" % example.guid)
+            logger.info("tokens: %s" % " ".join(tokens))
+            logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            logger.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+            logger.info("label: %s (id = %s)" % (example.labels, label_ids))
+
+        features.append(
+                InputFeatures(input_ids=input_ids,
+                              input_mask=input_mask,
+                              segment_ids=segment_ids,
+                              label_ids=label_ids)
+        )
+    return features
+
+
+class Metrics:
+    @staticmethod
+    def acc(predictions, labels):
+        return mtc.accuracy_score(labels, predictions)
+
+    @staticmethod
+    def mcc(predictions, labels):
+        return mtc.matthews_corrcoef(labels, predictions)
+
+    @staticmethod
+    def spc(predictions, labels):
+        return spearmanr(labels, predictions)[0]
+
+    @staticmethod
+    def f1(predictions, labels, average="micro"):
+        return mtc.f1_score(labels, predictions, average=average)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # Data config.
+    parser.add_argument("--data_dir", type=str, default="data/",
+                        help="Directory to contain the input data for all tasks.")
+    parser.add_argument("--task_name", type=str, default="MSRA",
+                        help="Name of the training task.")
+    parser.add_argument("--load_model_path", type=str, default="bert-base-chinese",
+                        help="Pre-trained model path to load if needed.")
+    parser.add_argument("--cache_dir", type=str, default="../cache/",
+                        help="Directory to store the pre-trained language models downloaded from s3.")
+    parser.add_argument("--output_dir", type=str, default="model/",
+                        help="Directory to output predictions and checkpoints.")
+
+    # Training config.
+    parser.add_argument("--do_train", action="store_true",
+                        help="Whether to run training.")
+    parser.add_argument("--do_eval", action="store_true",
+                        help="Whether to evaluate on the dev set.")
+    parser.add_argument("--eval_on", type=str, default="dev",
+                        help="Whether to evaluate on the test set.")
+    parser.add_argument("--use_slow_tokenizer", action="store_true",
+                        help="A slow tokenizer will be used if passed.")
+    parser.add_argument("--do_lower_case", action="store_true",
+                        help="Set this flag if you are using an uncased model.")
+    parser.add_argument("--max_seq_length", type=int, default=128,
+                        help="Maximum total input sequence length after word-piece tokenization.")
+    parser.add_argument("--train_batch_size", type=int, default=32,
+                        help="Total batch size for training.")
+    parser.add_argument("--eval_batch_size", type=int, default=64,
+                        help="Total batch size for evaluation.")
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
+                        help="Initial learning rate for Adam.")
+    parser.add_argument("--num_train_epochs", type=float, default=3.0,
+                        help="Total number of training epochs to perform.")
+    parser.add_argument("--max_train_steps", type=int, default=None,
+                        help="Total number of training steps to perform. If provided, overrides training epochs.")
+    parser.add_argument("--lr_scheduler_type", type=SchedulerType, default="linear",
+                        help="Scheduler type for learning rate warmup.")
+    parser.add_argument("--warmup_proportion", type=float, default=0.1,
+                        help="Proportion of training to perform learning rate warmup for.")
+    parser.add_argument("--weight_decay", type=float, default=0.,
+                        help="L2 weight decay for training.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of updates steps to accumulate before performing a backward pass.")
+    parser.add_argument("--no_cuda", action="store_true",
+                        help="Whether not to use CUDA when available.")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Whether to use mixed precision.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for initialization.")
+    parser.add_argument("--freelb", action="store_true",
+                        help="Whether to apply FreeLB adversarial training.")
+    parser.add_argument("--epsilon", type=float, default=1e-1,
+                        help="Scale of weight perturbation.")
+
+    args = parser.parse_args()
+
+    processors = {
+        "conll-03": ConllProcessor,
+        "wnut-17": WnutProcessor,
+        "msra": MsraProcessor,
+        "ontonotes-5-ch": OntonotesProcessor,
+        "ontonotes-5-en": OntonotesProcessor,
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    n_gpu = torch.cuda.device_count()
+    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
+        device, n_gpu, "Unsupported", "Unsupported"))
+
+    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    if args.do_train:
+        torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
+    elif args.do_test:
+        torch.save(args, os.path.join(args.output_dir, "test_args.bin"))
+
+    task_name = args.task_name.lower()
+    if task_name not in processors:
+        raise ValueError("Task not found: %s" % task_name)
+
+    processor = processors[task_name]()
+    label_list = processor.get_labels()
+    num_labels = len(label_list)
+
+    cache_dir = args.cache_dir
+    tokenizer = AutoTokenizer.from_pretrained(args.load_model_path,
+                                              do_lower_case=args.do_lower_case,
+                                              cache_dir=cache_dir,
+                                              use_fast=not args.use_slow_tokenizer,
+                                              add_prefix_space=True)
+
+    if args.do_train:
+        train_examples = processor.get_train_examples(os.path.join(args.data_dir, task_name))
+        train_features = convert_examples_to_features(train_examples, label_list, args.max_seq_length, tokenizer)
+
+        all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
+        all_label_ids = torch.tensor([f.label_ids for f in train_features], dtype=torch.long)
+
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+        train_sampler = RandomSampler(train_data)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        if args.max_train_steps is None:
+            args.max_train_steps = int(args.num_train_epochs * num_update_steps_per_epoch)
+        else:
+            args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+        model = AutoModelForTokenClassification.from_pretrained(args.load_model_path,
+                                                           num_labels=num_labels,
+                                                           return_dict=True,
+                                                           cache_dir=cache_dir)
+        model.to(device)
+        if n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": args.weight_decay
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0
+            }
+        ]
+
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        scheduler = get_scheduler(name=args.lr_scheduler_type,
+                                  optimizer=optimizer,
+                                  num_warmup_steps=args.max_train_steps * args.warmup_proportion,
+                                  num_training_steps=args.max_train_steps)
+
+        scaler = None
+        if args.fp16:
+            from torch.cuda.amp import autocast, GradScaler
+
+            scaler = GradScaler()
+        
+        if args.do_eval:
+            if args.eval_on == "dev":
+                eval_examples = processor.get_dev_examples(os.path.join(args.data_dir, task_name))
+            else:
+                eval_examples = processor.get_test_examples(os.path.join(args.data_dir, task_name))
+            eval_features = convert_examples_to_features(eval_examples, label_list, args.max_seq_length, tokenizer)
+
+            all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
+            all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
+            all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
+            all_label_ids = torch.tensor([f.label_ids for f in eval_features], dtype=torch.long)
+
+            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+            eval_sampler = SequentialSampler(eval_data)
+            eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+    if args.freelb:
+        trainer = FreeLBTrainer(model, scaler=scaler)
+    else:
+        trainer = Trainer(model, scaler=scaler)
+
+    def perturb_weight(model, epsilon=1e-1):
+        with torch.no_grad():
+            for param in model.classifier.parameters():
+                delta = torch.empty_like(param).normal_(0, 1) * epsilon
+                param.add_(delta)
+
+    if args.do_train:
+        logger.info("***** Running training *****")
+        logger.info("  Num examples = %d", len(train_examples))
+        logger.info("  Batch size = %d", args.train_batch_size)
+        logger.info("  Num steps = %d", args.max_train_steps)
+
+        progress_bar = tqdm(range(args.max_train_steps))
+        global_step = 0
+        for epoch in range(int(args.num_train_epochs)):
+            model.train()
+            train_loss = 0
+            num_train_examples = 0
+            train_steps = 0
+            for step, batch in enumerate(train_dataloader):
+                batch = tuple(t.to(device) for t in batch)
+                input_ids, input_mask, segment_ids, label_ids = batch
+
+                perturb_weight(model, args.epsilon)
+
+                inputs = {}
+                inputs["input_ids"] = input_ids
+                inputs["attention_mask"] = input_mask
+                inputs["token_type_ids"] = segment_ids
+                inputs["labels"] = label_ids
+
+                loss = trainer.step(inputs)
+
+                train_loss += loss.item()
+                num_train_examples += input_ids.size(0)
+                train_steps += 1
+                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    if args.fp16:
+                        scaler.unscale_(optimizer)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
+                    progress_bar.update(1)
+
+                if global_step >= args.max_train_steps:
+                    break
+
+            model_to_save = model.module if hasattr(model, "module") else model
+            output_model_file = os.path.join(args.output_dir, "{}_pytorch_model.bin".format(epoch))
+            torch.save(model_to_save.state_dict(), output_model_file)
+
+            if args.do_eval:
+                logger.info("***** Running evaluation *****")
+                logger.info("  Num examples = %d", len(eval_examples))
+                logger.info("  Batch size = %d", args.eval_batch_size)
+
+                model.eval()
+                eval_loss = 0
+                num_eval_examples = 0
+                eval_steps = 0
+                all_predictions, all_labels = [], []
+                label_map = {i: label for i, label in enumerate(label_list)}
+                for batch in tqdm(eval_dataloader, desc="Evaluation"):
+                    batch = tuple(t.to(device) for t in batch)
+                    input_ids, input_mask, segment_ids, label_ids = batch
+                    with torch.no_grad():
+                        outputs = model(input_ids=input_ids,
+                                        attention_mask=input_mask,
+                                        token_type_ids=segment_ids,
+                                        labels=label_ids)
+                        tmp_eval_loss = outputs.loss
+                        logits = outputs.logits
+
+                    logits = logits.detach().cpu().numpy()
+                    label_ids = label_ids.to("cpu").numpy()
+                    eval_loss += tmp_eval_loss.mean().item()
+                    tmp_predictions = np.argmax(logits, axis=2).reshape(-1).tolist()
+                    tmp_labels = label_ids.reshape(-1).tolist()
+                    all_predictions.extend([p for p, l in zip(tmp_predictions, tmp_labels) if l != -100])
+                    all_labels.extend([l for l in tmp_labels if l != -100])
+                    num_eval_examples += input_ids.size(0)
+                    eval_steps += 1
+
+                loss = train_loss / train_steps
+                eval_loss = eval_loss / eval_steps
+                eval_acc = mtc.f1_score(all_labels,
+                                        all_predictions,
+                                        labels=list(range(1, num_labels)),
+                                        average="micro") * 100
+
+                result = {
+                    "global_step": global_step,
+                    "loss": loss,
+                    "eval_loss": eval_loss,
+                    "eval_acc": eval_acc,
+                }
+
+                output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+                with open(output_eval_file, "a") as writer:
+                    logger.info("***** Eval results *****")
+                    writer.write(
+                        "Epoch %s: global step = %s | loss = %.3f | eval score = %.2f | eval loss = %.3f\n"
+                        % (str(epoch),
+                           str(result["global_step"]),
+                           result["loss"],
+                           result["eval_acc"],
+                           result["eval_loss"]))
+                    for key in sorted(result.keys()):
+                        logger.info("Epoch: %s,  %s = %s", str(epoch), key, str(result[key]))
+
+
+if __name__ == "__main__":
+    main()
